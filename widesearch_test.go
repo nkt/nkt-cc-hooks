@@ -27,6 +27,20 @@ func tool(name, path string) hookIn {
 	return in
 }
 
+func monitor(cmd string) hookIn {
+	in := bash(cmd)
+	in.ToolName = "Monitor"
+	return in
+}
+
+func globPattern(pattern string) hookIn {
+	var in hookIn
+	in.ToolName = "Glob"
+	in.Cwd = testCwd
+	in.ToolInput.Pattern = pattern
+	return in
+}
+
 func TestBlocks(t *testing.T) {
 	cases := []struct {
 		name string
@@ -52,10 +66,32 @@ func TestBlocks(t *testing.T) {
 		{"command substitution is inspected", bash("echo $(find / -name x)")},
 		{"rg with pattern flag then root", bash("rg -e foo /")},
 		{"find /Users", bash("find /Users -name x")},
+		{"monitor command", monitor("find / -name x")},
+
+		// Gaps found by the 2026-11 audit: each is a real walk the parser missed.
+		{"find -L before root", bash("find -L / -name x")},
+		{"find -H before home", bash("find -H ~ -name x")},
+		{"path after the expression", bash("find -name x /")},
+		{"bfs by name", bash("bfs / -name x")},
+		{"ugrep by name", bash("ugrep -r foo /")},
+		{"ug by name", bash("ug -r foo ~")},
+		{"timeout prefix", bash("timeout 30 find / -name x")},
+		{"timeout with flags", bash("timeout -k 5 30 rg foo /")},
+		{"env with assignment", bash("env X=1 find / -name x")},
+		{"bare assignment", bash("VAR=1 rg x ~")},
+		{"sudo -u", bash("sudo -u root find / -name x")},
+		{"if condition", bash("if find / -name x; then echo y; fi")},
+		{"loop body", bash("for d in a b; do find / -name $d; done")},
+		{"brace group", bash("{ find / -name x; }")},
+		{"negation", bash("! grep -r foo /")},
+		{"rg --files", bash("rg --files /")},
+		{"glob tool absolute pattern", globPattern("/**/*.jar")},
+		{"glob tool home pattern", globPattern("/Users/dev/**/AuthKey_*.p8")},
+		{"glob tool tilde pattern", globPattern("~/**/*.p8")},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if _, blocked := decide(c.in, testHome); !blocked {
+			if _, blocked := decideWide(c.in, testHome); !blocked {
 				t.Error("expected block, got allow")
 			}
 		})
@@ -88,7 +124,7 @@ func TestRegressionsFromHistory(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if tok, blocked := decide(c.in, testHome); blocked {
+			if tok, blocked := decideWide(c.in, testHome); blocked {
 				t.Errorf("expected allow, got block on %q", tok)
 			}
 		})
@@ -115,13 +151,44 @@ func TestAllows(t *testing.T) {
 		{"url in pattern", bash(`grep -r "http://" src`)},
 		{"unrelated tool", tool("Read", "/Users/dev/.zshrc")},
 		{"cat outside project", bash("cat /Users/dev/.zshrc")},
+		{"maxdepth 0 only looks at root", bash("find / -maxdepth 0")},
+		{"command -v only looks find up", bash("command -v find")},
+		{"find name value is not a path", bash(`find . -name "/"`)},
+		{"exec args are not paths", bash(`find . -name x -exec echo / \;`)},
+		{"timeout duration is not the command", bash("timeout 30 ls /")},
+		{"assignment then non-search", bash("DEBUG=1 ls /")},
+		{"glob tool relative pattern", globPattern("**/*.ts")},
+		{"glob tool narrow absolute", globPattern("/Users/dev/projects/**/*.ts")},
+		{"glob tool literal file in home", globPattern("/Users/dev/.zshrc")},
+		{"glob tool literal root dir", globPattern("/tmp")},
+		{"rg --files relative", bash("rg --files src")},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if tok, blocked := decide(c.in, testHome); blocked {
+			if tok, blocked := decideWide(c.in, testHome); blocked {
 				t.Errorf("expected allow, got block on %q", tok)
 			}
 		})
+	}
+}
+
+// A command no parser reads cannot be checked, so it never runs — not on a
+// repeat, not in a subagent.
+func TestUnparsedIsRefused(t *testing.T) {
+	broken := bash("echo \"`unterminated")
+	for i := 0; i < 2; i++ {
+		if reason := unparsedReason(broken); !strings.Contains(reason, "does not parse") {
+			t.Fatalf("attempt %d: reason %q", i+1, reason)
+		}
+	}
+	if reason := unparsedReason(monitor("echo \"`unterminated")); reason == "" {
+		t.Error("Monitor commands are shell commands too")
+	}
+	if reason := unparsedReason(bash("find . -name x")); reason != "" {
+		t.Errorf("a command that parses must not be refused: %q", reason)
+	}
+	if reason := unparsedReason(tool("Grep", "src")); reason != "" {
+		t.Errorf("only shell commands are parsed: %q", reason)
 	}
 }
 
@@ -161,12 +228,12 @@ func TestRespond(t *testing.T) {
 		{"main first hit explains", main, false, "deny", "use a relative path"},
 		{"main repeat escalates to the user", main, true, "ask", "Confirm with the user"},
 		{"subagent first hit explains", sub, false, "deny", "use a relative path"},
-		{"subagent first hit does not promise a prompt", sub, false, "deny", "no confirmation prompt inside a subagent"},
-		{"subagent repeat stays a deny", sub, true, "deny", "cannot escalate to the user"},
+		{"subagent first hit does not promise a prompt", sub, false, "deny", "does not escalate this to the user"},
+		{"subagent repeat stays a deny", sub, true, "deny", "does not escalate to the user"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			decision, reason := respond(c.in, "/", c.repeat)
+			decision, reason := respondWide(c.in, "/", c.repeat)
 			if decision != c.decision {
 				t.Errorf("got decision %q, want %q", decision, c.decision)
 			}
@@ -188,33 +255,11 @@ func TestEveryReasonNamesAWayForward(t *testing.T) {
 		{SessionID: "s1", AgentID: "agent-a", Cwd: testCwd},
 	} {
 		for _, repeat := range []bool{false, true} {
-			_, reason := respond(in, "/", repeat)
+			_, reason := respondWide(in, "/", repeat)
 			if !strings.Contains(reason, "/") {
 				t.Errorf("reason gives no concrete path to try instead: %q", reason)
 			}
 		}
-	}
-}
-
-func TestSplitSegments(t *testing.T) {
-	cases := []struct {
-		cmd  string
-		want [][]string
-	}{
-		{`rg "a | b" src`, [][]string{{"rg", "a | b", "src"}}},
-		{`echo hi | grep x`, [][]string{{"echo", "hi"}, {"grep", "x"}}},
-		{`grep '//' f`, [][]string{{"grep", "//", "f"}}},
-		{`find "/" -name x`, [][]string{{"find", "/", "-name", "x"}}},
-		{"a\nfind / -name x", [][]string{{"a"}, {"find", "/", "-name", "x"}}},
-		{`echo "a;b"`, [][]string{{"echo", "a;b"}}},
-		{`grep -e "x\"y" f`, [][]string{{"grep", "-e", `x"y`, "f"}}},
-	}
-	for _, c := range cases {
-		t.Run(c.cmd, func(t *testing.T) {
-			if got := splitSegments(c.cmd); !reflect.DeepEqual(got, c.want) {
-				t.Errorf("got %q, want %q", got, c.want)
-			}
-		})
 	}
 }
 

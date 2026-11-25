@@ -1,3 +1,5 @@
-module github.com/nkt/cc-block-wide-search
+module github.com/nkt/nkt-cc-hooks
 
-go 1.26
+go 1.26.0
+
+require mvdan.cc/sh/v3 v3.14.1

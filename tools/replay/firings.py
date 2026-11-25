@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Report where the hook actually fired, and what the model did next.
+"""Report where the hooks actually fired, and what the model did next.
 
 replay.py answers "what would this block". This answers the question that
-matters more once the hook is installed: when it did block, did the model
+matters more once a hook is installed: when it did block, did the model
 recover? Each firing is printed with the tool calls that followed it, so a
 model that re-scoped correctly is visible at a glance — as is one that argued
 with the wall.
@@ -27,8 +27,12 @@ import pathlib
 import re
 import sys
 
-# Openings of the four messages the hook can produce.
-HOOK_MARKERS = ("Search scoped to", "Global search of")
+# Text that identifies each hook's refusals. The old standalone names stay so
+# that history from before cc-hooks still reads.
+HOOK_MARKERS = {
+    "wide-search": ("Search scoped to", "Global search of"),
+    "secrets": ("cc-hooks secrets hook", "block-secret-reads hook"),
+}
 
 GENERIC_DENIAL = (
     "Permission for this tool use was denied",
@@ -85,8 +89,15 @@ def identify(path, root):
     return session, "main" if stem == session else stem
 
 
+def hook_denied(entry):
+    """Transcripts record who refused a tool call on the result entry."""
+    decision = entry.get("permissionDecision")
+    return isinstance(decision, dict) and decision.get("source") == "hook"
+
+
 def scan(path, root, follow):
-    entries = load(path)
+    # api-request-blob entries repeat tool results already in the transcript.
+    entries = [e for e in load(path) if e.get("type") != "api-request-blob"]
     uses = {}
     for index, entry in enumerate(entries):
         for block in tool_uses(entry):
@@ -94,6 +105,7 @@ def scan(path, root, follow):
 
     session, agent = identify(path, root)
     found = []
+    reported = set()
     for entry in entries:
         content = entry.get("message", {}).get("content")
         if not isinstance(content, list):
@@ -101,19 +113,27 @@ def scan(path, root, follow):
         for block in content:
             if not isinstance(block, dict) or block.get("type") != "tool_result":
                 continue
-            use = uses.get(block.get("tool_use_id"))
-            if not use:
+            use_id = block.get("tool_use_id")
+            use = uses.get(use_id)
+            if not use or use_id in reported:
                 continue
             index, name, tool_input = use
             result = json.dumps(block.get("content", ""), ensure_ascii=False)
             command = describe(name, tool_input)
 
-            if any(m in result for m in HOOK_MARKERS):
-                kind = "blocked"
+            hook = next(
+                (h for h, marks in HOOK_MARKERS.items() if any(m in result for m in marks)),
+                None,
+            )
+            if hook:
+                kind = f"blocked by {hook}"
             elif any(m in result for m in GENERIC_DENIAL) and WIDE_SEARCH.search(command):
                 kind = "escalated, reason not delivered"
+            elif hook_denied(entry) and WIDE_SEARCH.search(command):
+                kind = "refused by a hook, reason not in transcript"
             else:
                 continue
+            reported.add(use_id)
 
             after = []
             for later in entries[index + 1 :]:

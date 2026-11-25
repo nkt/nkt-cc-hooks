@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Replay historical Bash calls from Claude Code transcripts through the hook.
+"""Replay historical Bash calls from Claude Code transcripts through a hook.
 
-The only real risk this hook carries is the false positive: a command like
+The only real risk these hooks carry is the false positive: a command like
 `rg -c "QR / external wallet" src/i18n` reads as a search of `/` to a naive
 parser, and blocking it would be worse than never having installed the hook at
 all. Reasoning about the parser does not find those — replaying a few thousand
@@ -11,7 +11,9 @@ Run it after any change to the parsing, and read the blocked list by hand: the
 number is not the answer, the commands are. Anything in there you would have
 wanted to run is a bug.
 
-    python3 tools/replay/replay.py --hook ./block-wide-search
+    go build -o nkt-cc-hooks .
+    python3 tools/replay/replay.py --hook "./nkt-cc-hooks wide-search"
+    python3 tools/replay/replay.py --hook "./nkt-cc-hooks secrets --allow .env.development"
 
 Payloads are built without a session id on purpose, so the hook records no
 state and every call is judged as a first attempt.
@@ -22,6 +24,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import sys
 
@@ -61,10 +64,11 @@ def bash_calls(path):
 
 
 ROOT = re.compile(r'^\w[\w ]* (?:scoped to|search of) "([^"]*)"')
+SECRETS = re.compile(r"hook: (.+?)\. ")
 
 
 def verdict(hook, cwd, command):
-    """Return (decision, offending root), or None when the hook stays silent.
+    """Return (decision, offending target), or None when the hook stays silent.
 
     The root is pulled back out of the reason because a long command truncated
     for display can easily hide the very token that triggered the block, which
@@ -74,7 +78,7 @@ def verdict(hook, cwd, command):
         {"tool_name": "Bash", "cwd": cwd, "tool_input": {"command": command}}
     )
     out = subprocess.run(
-        [hook], input=payload, capture_output=True, text=True
+        hook, input=payload, capture_output=True, text=True
     ).stdout.strip()
     if not out:
         return None
@@ -82,7 +86,8 @@ def verdict(hook, cwd, command):
         decision = json.loads(out)["hookSpecificOutput"]
     except (ValueError, KeyError):
         return None
-    match = ROOT.match(decision.get("permissionDecisionReason", ""))
+    reason = decision.get("permissionDecisionReason", "")
+    match = ROOT.match(reason) or SECRETS.search(reason)
     return decision["permissionDecision"], match.group(1) if match else "?"
 
 
@@ -95,8 +100,8 @@ def main():
     )
     ap.add_argument(
         "--hook",
-        default=os.path.expanduser("~/.claude/hooks/bin/block-wide-search"),
-        help="hook binary to replay against",
+        default=os.path.expanduser("~/.claude/hooks/bin/nkt-cc-hooks") + " wide-search",
+        help="hook command line to replay against, e.g. './nkt-cc-hooks wide-search'",
     )
     ap.add_argument(
         "--width", type=int, default=140, help="truncate printed commands (0 = full)"
@@ -106,7 +111,8 @@ def main():
     )
     args = ap.parse_args()
 
-    if not os.path.exists(args.hook):
+    hook = shlex.split(args.hook)
+    if not hook or not os.path.exists(hook[0]):
         sys.exit(f"hook binary not found: {args.hook}")
 
     total = 0
@@ -124,7 +130,7 @@ def main():
 
     blocked = []
     for cwd, command in seen:
-        result = verdict(args.hook, cwd, command)
+        result = verdict(hook, cwd, command)
         if result:
             decision, root = result
             blocked.append((decision, root, cwd, command, seen[(cwd, command)]))
